@@ -1,0 +1,15 @@
+{
+  "name": "mergeo-translation-relay",
+  "version": "1.0.0",
+  "description": "WebSocket relay + translation proxy for the two-device pairing translator",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "ws": "^8.16.0"
+  }
+}
