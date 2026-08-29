@@ -34,7 +34,9 @@
 // Render's dashboard. LibreTranslate always works as the free, no-key baseline.
 
 const http = require('http');
+const crypto = require('crypto');
 const { WebSocketServer } = require('ws');
+const WebSocketClient = require('ws'); // same 'ws' package, used here as an outgoing client
 
 const PORT = process.env.PORT || 3000;
 
@@ -213,6 +215,121 @@ async function translateText(text, fromCode, toCode) {
   }
 }
 
+// --- Edge neural TTS proxy (POST /tts) ------------------------------------------
+//
+// Why this needs to live on the server and not the browser: Microsoft's TTS
+// websocket requires a handshake with specific headers (Origin, User-Agent, a
+// timestamp-derived Sec-MS-GEC hash). A browser's built-in WebSocket object is not
+// allowed to set custom headers on the handshake — it always sends the page's own
+// Origin, which Microsoft's server rejects — so this previously only "worked" inside
+// the real Edge browser, which gets to attach these internally. It was never actually
+// an Edge-the-browser requirement; it's a set-custom-headers requirement, and Node's
+// `ws` client (already a dependency here) can set exactly what's needed. Doing it here
+// means every visitor gets a real Persian/Urdu neural voice regardless of their
+// browser or OS (this fixes iOS Safari specifically, which has no native voice for
+// either language and was silently falling through to an unreliable Google endpoint).
+const TRUSTED_CLIENT_TOKEN = '6A5AA1D4EAFF4E9FB37E23D68491D6F4';
+const EDGE_VOICES = {
+  'fa-IR': 'fa-IR-DilaraNeural', 'ar-SA': 'ar-SA-ZariyahNeural', 'en-US': 'en-US-AriaNeural',
+  'tr-TR': 'tr-TR-EmelNeural', 'fr-FR': 'fr-FR-DeniseNeural', 'de-DE': 'de-DE-KatjaNeural',
+  'es-ES': 'es-ES-ElviraNeural', 'it-IT': 'it-IT-ElsaNeural', 'ru-RU': 'ru-RU-SvetlanaNeural',
+  'ja-JP': 'ja-JP-NanamiNeural', 'ko-KR': 'ko-KR-SunHiNeural', 'hi-IN': 'hi-IN-SwaraNeural',
+  'ur-PK': 'ur-PK-UzmaNeural', 'pt-PT': 'pt-PT-RaquelNeural', 'nl-NL': 'nl-NL-ColetteNeural',
+  'sv-SE': 'sv-SE-SofieNeural', 'pl-PL': 'pl-PL-ZofiaNeural', 'uk-UA': 'uk-UA-PolinaNeural',
+  'id-ID': 'id-ID-GadisNeural', 'vi-VN': 'vi-VN-HoaiMyNeural', 'th-TH': 'th-TH-PremwadeeNeural',
+  'he-IL': 'he-IL-HilaNeural', 'el-GR': 'el-GR-AthinaNeural', 'ro-RO': 'ro-RO-AlinaNeural',
+  'bn-BD': 'bn-BD-NabanitaNeural', 'ms-MY': 'ms-MY-YasminNeural',
+};
+// Chosen to match a recent real Edge/Chromium release — must stay in sync with the
+// version string embedded in EDGE_UA below (both feed into what the handshake expects).
+const CHROMIUM_VERSION = '131.0.0.0';
+const EDGE_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) '
+  + 'Chrome/' + CHROMIUM_VERSION + ' Safari/537.36 Edg/' + CHROMIUM_VERSION;
+
+function generateSecMsGec() {
+  // Windows-epoch seconds, rounded down to the nearest 5 minutes, converted to 100ns
+  // ticks, hashed together with the trusted-client token — this is Microsoft's own
+  // clock-derived anti-abuse token, reverse-engineered by the open-source edge-tts
+  // projects this mirrors.
+  const WIN_EPOCH = 11644473600;
+  let ticks = Math.floor(Date.now() / 1000) + WIN_EPOCH;
+  ticks -= ticks % 300;
+  ticks *= 10000000;
+  return crypto.createHash('sha256').update(String(ticks) + TRUSTED_CLIENT_TOKEN).digest('hex').toUpperCase();
+}
+
+function escapeXml(s) {
+  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&apos;');
+}
+
+function randomHexId() {
+  return crypto.randomBytes(16).toString('hex');
+}
+
+function synthesizeEdgeTts(text, bcp) {
+  return new Promise((resolve, reject) => {
+    const voice = EDGE_VOICES[bcp] || EDGE_VOICES['en-US'];
+    const wsUrl = 'wss://speech.platform.bing.com/consumer/speech/synthesize/readaloud/edge/v1'
+      + '?TrustedClientToken=' + TRUSTED_CLIENT_TOKEN
+      + '&Sec-MS-GEC=' + generateSecMsGec()
+      + '&Sec-MS-GEC-Version=1-' + CHROMIUM_VERSION
+      + '&ConnectionId=' + randomHexId();
+
+    let ws;
+    try {
+      ws = new WebSocketClient(wsUrl, {
+        headers: {
+          'Pragma': 'no-cache',
+          'Cache-Control': 'no-cache',
+          'Origin': 'chrome-extension://jdiccldimpdaibmpdkjnbmckianbfold',
+          'User-Agent': EDGE_UA,
+          'Accept-Encoding': 'gzip, deflate, br',
+          'Accept-Language': 'en-US,en;q=0.9',
+        },
+      });
+    } catch (e) { reject(e); return; }
+
+    const audioParts = [];
+    let settled = false;
+    const finish = (fn, arg) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      try { ws.close(); } catch (_) {}
+      fn(arg);
+    };
+    const timer = setTimeout(() => finish(reject, new Error('edge-timeout')), Math.max(8000, text.length * 150));
+
+    ws.on('open', () => {
+      const ts = new Date().toISOString();
+      ws.send('X-Timestamp:' + ts + '\r\nContent-Type:application/json; charset=utf-8\r\nPath:speech.config\r\n\r\n'
+        + '{"context":{"synthesis":{"audio":{"metadataoptions":{"sentenceBoundaryEnabled":"false","wordBoundaryEnabled":"false"},"outputFormat":"audio-24khz-48kbitrate-mono-mp3"}}}}');
+      const ssml = "<speak version='1.0' xmlns='http://www.w3.org/2001/10/synthesis' xml:lang='" + voice.slice(0, 5) + "'>"
+        + "<voice name='" + voice + "'><prosody pitch='+0Hz' rate='+0%' volume='+0%'>" + escapeXml(text) + "</prosody></voice></speak>";
+      ws.send('X-RequestId:' + randomHexId() + '\r\nContent-Type:application/ssml+xml\r\nX-Timestamp:' + ts + 'Z\r\nPath:ssml\r\n\r\n' + ssml);
+    });
+
+    ws.on('message', (data, isBinary) => {
+      if (!isBinary) {
+        const str = data.toString('utf8');
+        if (str.indexOf('Path:turn.end') !== -1) {
+          if (!audioParts.length) { finish(reject, new Error('edge-no-audio')); return; }
+          finish(resolve, Buffer.concat(audioParts));
+        }
+      } else {
+        // Binary frame: first 2 bytes = header length (big-endian), header text
+        // follows, then raw mp3 bytes.
+        const headerLen = data.readUInt16BE(0);
+        const audioBytes = data.subarray(2 + headerLen);
+        if (audioBytes.length) audioParts.push(audioBytes);
+      }
+    });
+
+    ws.on('error', (err) => finish(reject, err));
+    ws.on('close', () => finish(reject, new Error('edge-closed-early')));
+  });
+}
+
 function readJsonBody(req, maxBytes) {
   return new Promise((resolve, reject) => {
     let size = 0;
@@ -230,7 +347,7 @@ function readJsonBody(req, maxBytes) {
   });
 }
 
-// --- HTTP server: health check + /translate proxy -----------------------------
+// --- HTTP server: health check + /translate + /tts proxies ---------------------
 
 const server = http.createServer(async (req, res) => {
   // CORS: this server is called from a browser on a different origin (the static
@@ -264,12 +381,34 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  if (req.method === 'POST' && req.url === '/tts') {
+    try {
+      const body = await readJsonBody(req, 5000);
+      const { text, bcp } = body;
+      if (!text || !bcp) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'text و bcp لازم است' }));
+        return;
+      }
+      // 600 chars is a generous cap for one spoken sentence/chunk — the client
+      // already splits longer text before calling this.
+      const audio = await synthesizeEdgeTts(String(text).slice(0, 600), String(bcp));
+      res.writeHead(200, { 'Content-Type': 'audio/mpeg', 'Content-Length': audio.length });
+      res.end(audio);
+    } catch (err) {
+      res.writeHead(502, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: err.message || 'سنتز صدا انجام نشد' }));
+    }
+    return;
+  }
+
   // simple health check endpoint — also what keeps Render's free tier happy to report "up"
   res.writeHead(200, { 'Content-Type': 'text/plain' });
   const status = [
     ANTHROPIC_API_KEY ? 'Claude configured' : 'Claude NOT configured',
     DEEPL_API_KEY ? 'DeepL configured' : 'DeepL NOT configured',
     'LibreTranslate fallback always available (open-source, no key needed)',
+    'Edge neural TTS proxy available at POST /tts',
   ].join(', ');
   res.end('translation relay server is running (' + status + ')');
 });
