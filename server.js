@@ -316,41 +316,6 @@ function synthesizeEdgeTts(text, bcp) {
   });
 }
 
-// Second-layer fallback: Microsoft has been actively tightening/blocking this exact
-// reverse-engineered endpoint recently (other open-source projects built on the same
-// trick have been hitting the identical 403 this month, unrelated to anything in this
-// file) — so Edge TTS can no longer be assumed reliable. This proxies Google
-// Translate's TTS endpoint from the server instead of the browser, which fixes the
-// original problem too (visitors whose own network blocks Google directly still reach
-// it fine through Render).
-function splitForGoogleTts(text, maxLen) {
-  const parts = [];
-  let remaining = text.trim();
-  while (remaining.length > maxLen) {
-    let cut = remaining.lastIndexOf(' ', maxLen);
-    if (cut <= 0) cut = maxLen;
-    parts.push(remaining.slice(0, cut));
-    remaining = remaining.slice(cut).trim();
-  }
-  if (remaining) parts.push(remaining);
-  return parts;
-}
-async function synthesizeGoogleTts(text, langCode2) {
-  const chunks = splitForGoogleTts(text, 180); // Google's own per-request limit
-  const buffers = [];
-  for (const chunk of chunks) {
-    const url = 'https://translate.googleapis.com/translate_tts?ie=UTF-8&q='
-      + encodeURIComponent(chunk) + '&tl=' + encodeURIComponent(langCode2) + '&client=tw-ob';
-    const resp = await fetch(url, {
-      headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36' },
-    });
-    if (!resp.ok) throw new Error('google-tts-http-' + resp.status);
-    buffers.push(Buffer.from(await resp.arrayBuffer()));
-  }
-  if (!buffers.length) throw new Error('google-tts-empty');
-  return Buffer.concat(buffers); // concatenated mp3 chunks play back fine as one file
-}
-
 function readJsonBody(req, maxBytes) {
   return new Promise((resolve, reject) => {
     let size = 0;
@@ -411,19 +376,8 @@ const server = http.createServer(async (req, res) => {
         res.end(JSON.stringify({ error: 'text و bcp لازم است' }));
         return;
       }
-      let audio, engine;
-      try {
-        audio = await synthesizeEdgeTts(String(text), String(bcp));
-        engine = 'edge';
-      } catch (edgeErr) {
-        try {
-          audio = await synthesizeGoogleTts(String(text), String(bcp).slice(0, 2));
-          engine = 'google-fallback';
-        } catch (googleErr) {
-          throw new Error('edge: ' + edgeErr.message + ' | google: ' + googleErr.message);
-        }
-      }
-      res.writeHead(200, { 'Content-Type': 'audio/mpeg', 'X-TTS-Engine': engine });
+      const audio = await synthesizeEdgeTts(String(text), String(bcp));
+      res.writeHead(200, { 'Content-Type': 'audio/mpeg' });
       res.end(audio);
     } catch (err) {
       res.writeHead(502, { 'Content-Type': 'application/json' });
@@ -477,49 +431,4 @@ wss.on('connection', (ws) => {
 
     if (msg.type === 'setLang') {
       // Lets either side change their spoken language mid-session (not just at
-      // create/join time) — relayed to the other side so their translation target
-      // updates immediately, same as it does at join time.
-      const s = sessions.get(ws.code);
-      if (!s) return;
-      if (ws.role === 'host') s.hostLang = msg.lang;
-      if (ws.role === 'guest') s.guestLang = msg.lang;
-      send(otherSide(s, ws.role), { type: 'partnerLangChanged', lang: msg.lang });
-      return;
-    }
-
-    if (msg.type === 'chat') {
-      // relay a translated message straight to the other participant, no storage involved
-      const s = sessions.get(ws.code);
-      if (!s) return;
-      const target = otherSide(s, ws.role);
-      send(target, { type: 'chat', from: ws.role, original: msg.original, translated: msg.translated });
-      return;
-    }
-
-    if (msg.type === 'leave') {
-      cleanupConnection(ws);
-      return;
-    }
-  });
-
-  ws.on('close', () => cleanupConnection(ws));
-});
-
-function cleanupConnection(ws) {
-  if (!ws.code) return;
-  const s = sessions.get(ws.code);
-  if (!s) return;
-  if (ws.role === 'host') s.host = null;
-  if (ws.role === 'guest') s.guest = null;
-  broadcastPresence(ws.code);
-  // if both sides are gone, free the session
-  if (!s.host && !s.guest) sessions.delete(ws.code);
-}
-
-server.listen(PORT, () => {
-  const status = [
-    ANTHROPIC_API_KEY ? 'Claude configured' : 'Claude NOT configured',
-    DEEPL_API_KEY ? 'DeepL configured' : 'DeepL NOT configured',
-  ].join(', ');
-  console.log('relay server listening on port ' + PORT + ' — ' + status);
-});
+      // create/join time) — relayed to the other sid
